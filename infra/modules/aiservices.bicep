@@ -4,8 +4,8 @@ param identityId string
 param tags object
 
 // Voice live api only supported on two regions now 
-var location string = 'swedencentral'
-var aiServicesName string = 'aiServices-${environmentName}-${uniqueSuffix}'
+var location = 'swedencentral'
+var aiServicesName = 'aiServices-${environmentName}-${uniqueSuffix}'
 
 @allowed([
   'S0'
@@ -34,8 +34,6 @@ resource aiServices 'Microsoft.CognitiveServices/accounts@2023-05-01' = {
   }
 }
 
-@secure()
-output aiServicesKey string = aiServices.listKeys().key1
 output aiServicesEndpoint string = aiServices.properties.endpoint
 output aiServicesId string = aiServices.id
 output aiServicesName string = aiServices.name

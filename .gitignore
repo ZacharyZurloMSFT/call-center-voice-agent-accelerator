@@ -130,6 +130,16 @@ ENV/
 env.bak/
 venv.bak/
 
+# Secrets and local configuration
+**/.env
+*.env
+*.env.*
+*.secrets
+*.secrets.*
+secrets.*
+**/secrets.*
+local.settings.json
+
 # Spyder project settings
 .spyderproject
 .spyproject

@@ -1,6 +1,7 @@
 param identityPrincipalId string
 param aiServicesId string
 param keyVaultName string
+param cosmosAccountId string
 
 resource aiServicesResource 'Microsoft.CognitiveServices/accounts@2023-05-01' existing = {
   name: last(split(aiServicesId, '/'))
@@ -36,6 +37,20 @@ resource keyVaultRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04
   scope: keyVault
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'b86a8fe4-44ce-4948-aee5-eccb2c155cd7')
+    principalId: identityPrincipalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource cosmosAccount 'Microsoft.DocumentDB/databaseAccounts@2023-04-15' existing = {
+  name: last(split(cosmosAccountId, '/'))
+}
+
+resource cosmosRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(cosmosAccount.id, identityPrincipalId, 'Cosmos DB Built-in Data Contributor')
+  scope: cosmosAccount
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '00000000-0000-0000-0000-000000000002')
     principalId: identityPrincipalId
     principalType: 'ServicePrincipal'
   }

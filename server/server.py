@@ -1,11 +1,11 @@
 import asyncio
+import json
 import logging
 import os
 
-from app.handler.acs_event_handler import AcsEventHandler
 from app.handler.acs_media_handler import ACSMediaHandler
 from dotenv import load_dotenv
-from quart import Quart, request, websocket
+from quart import Quart, websocket
 
 load_dotenv()
 
@@ -13,48 +13,19 @@ app = Quart(__name__)
 app.config["AZURE_VOICE_LIVE_API_KEY"] = os.getenv("AZURE_VOICE_LIVE_API_KEY", "")
 app.config["AZURE_VOICE_LIVE_ENDPOINT"] = os.getenv("AZURE_VOICE_LIVE_ENDPOINT")
 app.config["VOICE_LIVE_MODEL"] = os.getenv("VOICE_LIVE_MODEL", "gpt-4o-mini")
-app.config["ACS_CONNECTION_STRING"] = os.getenv("ACS_CONNECTION_STRING")
-app.config["ACS_DEV_TUNNEL"] = os.getenv("ACS_DEV_TUNNEL", "")
 app.config["AZURE_USER_ASSIGNED_IDENTITY_CLIENT_ID"] = os.getenv(
     "AZURE_USER_ASSIGNED_IDENTITY_CLIENT_ID", ""
 )
 
+# Cosmos DB configuration for conversation storage
+app.config["COSMOS_DB_ENDPOINT"] = os.getenv("COSMOS_DB_ENDPOINT", "")
+app.config["COSMOS_DB_KEY"] = os.getenv("COSMOS_DB_KEY", "")
+app.config["COSMOS_DB_DATABASE_NAME"] = os.getenv("COSMOS_DB_DATABASE_NAME", "conversationdb")
+app.config["COSMOS_DB_CONTAINER_NAME"] = os.getenv("COSMOS_DB_CONTAINER_NAME", "transcripts")
+
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s: %(message)s"
 )
-
-acs_handler = AcsEventHandler(app.config)
-
-
-@app.route("/acs/incomingcall", methods=["POST"])
-async def incoming_call_handler():
-    """Handles initial incoming call event from EventGrid."""
-    events = await request.get_json()
-    host_url = request.host_url.replace("http://", "https://", 1).rstrip("/")
-    return await acs_handler.process_incoming_call(events, host_url, app.config)
-
-
-@app.route("/acs/callbacks/<context_id>", methods=["POST"])
-async def acs_event_callbacks(context_id):
-    """Handles ACS event callbacks for call connection and streaming events."""
-    raw_events = await request.get_json()
-    return await acs_handler.process_callback_events(context_id, raw_events, app.config)
-
-
-@app.websocket("/acs/ws")
-async def acs_ws():
-    """WebSocket endpoint for ACS to send audio to Voice Live."""
-    logger = logging.getLogger("acs_ws")
-    logger.info("Incoming ACS WebSocket connection")
-    handler = ACSMediaHandler(app.config)
-    await handler.init_incoming_websocket(websocket, is_raw_audio=False)
-    asyncio.create_task(handler.connect())
-    try:
-        while True:
-            msg = await websocket.receive()
-            await handler.acs_to_voicelive(msg)
-    except Exception:
-        logger.exception("ACS WebSocket connection closed")
 
 
 @app.websocket("/web/ws")
@@ -68,7 +39,27 @@ async def web_ws():
     try:
         while True:
             msg = await websocket.receive()
-            await handler.web_to_voicelive(msg)
+            # if msg is binary audio data, forward to Voice Live
+            if isinstance(msg, (bytes, bytearray)):
+                await handler.web_to_voicelive(msg)
+            else:
+                # try to parse JSON commands from the web client
+                try:
+                    payload = json.loads(msg)
+                    if isinstance(payload, dict) and payload.get("Kind") == "UploadTranscript":
+                        logger.info("web_ws received UploadTranscript command from client")
+                        try:
+                            uploaded = await handler.upload_transcript()
+                            if uploaded:
+                                logger.info("Transcript upload successful for session %s", getattr(handler, 'session_id', 'unknown'))
+                            else:
+                                logger.info("Transcript upload was skipped or failed for session %s", getattr(handler, 'session_id', 'unknown'))
+                        except Exception:
+                            logger.exception("Error uploading transcript for session %s", getattr(handler, 'session_id', 'unknown'))
+                        continue
+                except Exception:
+                    # not a JSON command, ignore
+                    logger.debug("web_ws received non-json text message; ignoring")
     except Exception:
         logger.exception("Web WebSocket connection closed")
 

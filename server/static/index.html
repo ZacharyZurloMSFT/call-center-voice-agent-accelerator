@@ -80,7 +80,7 @@
 </head>
 <body>
   <h1>🎙️ Voice Live Demo UX</h1>
-  <div class="subtitle">Talk to an AI agent in real time. Click below to start.</div>
+  <div class="subtitle">Talk to an AI customer service agent in real time. Ask about order status using customer and order IDs.</div>
 
   <div class="controls">
     <button id="startBtn" onclick="startStreaming()" title="Start talking to the voice agent">
@@ -89,6 +89,18 @@
     <button id="stopBtn" onclick="stopStreaming()" disabled title="End the conversation with the agent">
       Stop Conversation
     </button>
+  </div>
+
+  <div style="margin-top: 2rem; padding: 1rem; background: #e8f4fd; border-radius: 0.5rem; max-width: 600px; text-align: left;">
+    <h3 style="margin-top: 0; color: #0078d4;">🛍️ Try These Sample Orders:</h3>
+    <ul style="margin: 0.5rem 0;">
+      <li><strong>Customer CUST001, Order ORD12345</strong> - In Transit</li>
+      <li><strong>Customer CUST002, Order ORD67890</strong> - Delivered</li>
+      <li><strong>Customer CUST003, Order ORD11111</strong> - Processing</li>
+    </ul>
+    <p style="margin-bottom: 0; font-size: 0.9rem; color: #666;">
+      Example: "Can you check the status of order ORD12345 for customer CUST001?"
+    </p>
   </div>
 
   <audio id="ttsPlayer" autoplay></audio>
@@ -168,7 +180,38 @@
     }
 
     function stopStreaming() {
-      socket.close();
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        let responded = false;
+        const onUploadResult = (event) => {
+          if (typeof event.data === "string") {
+            try {
+              const msg = JSON.parse(event.data);
+              if (msg.Kind === "UploadResult") {
+                responded = true;
+                console.log("UploadResult:", msg);
+                socket.removeEventListener('message', onUploadResult);
+                socket.close();
+              }
+            } catch (e) {
+              /* ignore parse errors */
+            }
+          }
+        };
+        socket.addEventListener('message', onUploadResult);
+        try {
+          socket.send(JSON.stringify({ Kind: "UploadTranscript" }));
+        } catch (e) {
+          console.error("Failed to send UploadTranscript message", e);
+        }
+        // Fallback: close after 3 seconds if no ack is received
+        setTimeout(() => {
+          if (!responded) {
+            console.warn('No UploadResult ack received within timeout; closing socket');
+            try { socket.removeEventListener('message', onUploadResult); } catch(e) {}
+            socket.close();
+          }
+        }, 3000);
+      }
     }
 
     function startStreaming() {

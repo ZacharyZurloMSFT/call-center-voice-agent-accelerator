@@ -16,6 +16,7 @@ param location string
 var uniqueSuffix = substring(uniqueString(subscription().id, environmentName), 0, 5)
 
 param appExists bool
+param containerImage string = 'app-voiceagent'
 
 var tags = {'azd-env-name': environmentName }
 var rgName = 'rg-${environmentName}-${uniqueSuffix}'
@@ -61,7 +62,6 @@ module registry 'modules/containerregistry.bicep' = {
     identityName: appIdentity.outputs.name
     tags: tags
   }
-  dependsOn: [ appIdentity ]
 }
 
 
@@ -74,13 +74,23 @@ module aiServices 'modules/aiservices.bicep' = {
     identityId: appIdentity.outputs.identityId
     tags: tags
   }
-  dependsOn: [ appIdentity ]
 }
 
 module acs 'modules/acs.bicep' = {
   name: 'acs-deployment'
   scope: rg
   params: {
+    environmentName: environmentName
+    uniqueSuffix: uniqueSuffix
+    tags: tags
+  }
+}
+
+module cosmos 'modules/cosmosdb.bicep' = {
+  name: 'cosmos-deployment'
+  scope: rg
+  params: {
+    location: location
     environmentName: environmentName
     uniqueSuffix: uniqueSuffix
     tags: tags
@@ -96,10 +106,10 @@ module keyvault 'modules/keyvault.bicep' = {
     location: location
     keyVaultName: sanitizedKeyVaultName
     tags: tags
-    aiServicesKey: aiServices.outputs.aiServicesKey
-    acsConnectionString: acs.outputs.acsConnectionString
+    aiServicesId: aiServices.outputs.aiServicesId
+    acsResourceId: acs.outputs.acsResourceId
+    cosmosAccountId: cosmos.outputs.cosmosAccountId
   }
-  dependsOn: [ appIdentity, acs, aiServices ]
 }
 
 // Add role assignments 
@@ -110,8 +120,9 @@ module RoleAssignments 'modules/roleassignments.bicep' = {
     identityPrincipalId: appIdentity.outputs.principalId
     aiServicesId: aiServices.outputs.aiServicesId
     keyVaultName: sanitizedKeyVaultName
+    cosmosAccountId: cosmos.outputs.cosmosAccountId
   }
-  dependsOn: [ keyvault, appIdentity ] 
+  dependsOn: [ keyvault ] 
 }
 
 module containerapp 'modules/containerapp.bicep' = {
@@ -129,9 +140,14 @@ module containerapp 'modules/containerapp.bicep' = {
     modelDeploymentName: modelName
     aiServicesKeySecretUri: keyvault.outputs.aiServicesKeySecretUri
     acsConnectionStringSecretUri: keyvault.outputs.acsConnectionStringUri
+    cosmosKeySecretUri: keyvault.outputs.cosmosKeySecretUri
+    cosmosEndpoint: cosmos.outputs.cosmosEndpoint
+    cosmosDatabaseName: cosmos.outputs.databaseName
+    cosmosContainerName: cosmos.outputs.containerName
     logAnalyticsWorkspaceName: logAnalyticsName
+    containerImage: containerImage
   }
-  dependsOn: [keyvault, RoleAssignments]
+  dependsOn: [RoleAssignments]
 }
 
 

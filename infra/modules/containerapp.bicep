@@ -9,7 +9,12 @@ param aiServicesEndpoint string
 param modelDeploymentName string
 param aiServicesKeySecretUri string
 param acsConnectionStringSecretUri string
+param cosmosKeySecretUri string
+param cosmosEndpoint string
+param cosmosDatabaseName string
+param cosmosContainerName string
 param logAnalyticsWorkspaceName string
+param containerImage string = 'app-voiceagent'
 
 // Helper to sanitize environmentName for valid container app name
 var sanitizedEnvName = toLower(replace(replace(replace(replace(environmentName, ' ', '-'), '--', '-'), '[^a-zA-Z0-9-]', ''), '_', '-'))
@@ -76,13 +81,18 @@ resource containerApp 'Microsoft.App/containerApps@2024-10-02-preview' = {
           keyVaultUrl: acsConnectionStringSecretUri
           identity: identityId
         }
+        {
+          name: 'cosmos-db-key'
+          keyVaultUrl: cosmosKeySecretUri
+          identity: identityId
+        }
       ]
     }
     template: {
       containers: [
         {
           name: 'main'
-          image: fetchLatestImage.outputs.?containers[?0].?image ??'${containerRegistryName}.azurecr.io/voice-live-agent/app-voiceagent:latest'
+          image: containerImage != '' ? containerImage : (fetchLatestImage.outputs.?containers[?0].?image ?? '${containerRegistryName}.azurecr.io/voice-live-agent/app-voiceagent:latest')
           env: [
             {
               name: 'AZURE_VOICE_LIVE_API_KEY'
@@ -104,6 +114,22 @@ resource containerApp 'Microsoft.App/containerApps@2024-10-02-preview' = {
             {
               name: 'ACS_CONNECTION_STRING'
               secretRef: 'acs-connection-string'
+            }
+            {
+              name: 'COSMOS_DB_ENDPOINT'
+              value: cosmosEndpoint
+            }
+            {
+              name: 'COSMOS_DB_KEY'
+              secretRef: 'cosmos-db-key'
+            }
+            {
+              name: 'COSMOS_DB_DATABASE_NAME'
+              value: cosmosDatabaseName
+            }
+            {
+              name: 'COSMOS_DB_CONTAINER_NAME'
+              value: cosmosContainerName
             }
             {
               name: 'DEBUG_MODE'

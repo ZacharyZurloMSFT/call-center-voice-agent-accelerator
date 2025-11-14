@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Order Status</title>
+    <style>
+        body {{
+            font-family: Arial, sans-serif;
+            max-width: 600px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }}
+        .order-card {{
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }}
+        .order-header {{
+            border-bottom: 2px solid #007acc;
+            padding-bottom: 15px;
+            margin-bottom: 20px;
+        }}
+        .order-id {{
+            font-size: 24px;
+            font-weight: bold;
+            color: #007acc;
+            margin: 0;
+        }}
+        .customer-id {{
+            color: #666;
+            margin: 5px 0 0 0;
+        }}
+        .status {{
+            display: inline-block;
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-weight: bold;
+            text-transform: uppercase;
+            margin: 15px 0;
+        }}
+        .status.in-transit {{
+            background-color: #fff3cd;
+            color: #856404;
+            border: 1px solid #ffeaa7;
+        }}
+        .status.delivered {{
+            background-color: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }}
+        .status.processing {{
+            background-color: #cce5ff;
+            color: #004085;
+            border: 1px solid #99d6ff;
+        }}
+        .detail-row {{
+            display: flex;
+            justify-content: space-between;
+            padding: 10px 0;
+            border-bottom: 1px solid #eee;
+        }}
+        .detail-row:last-child {{
+            border-bottom: none;
+        }}
+        .detail-label {{
+            font-weight: bold;
+            color: #333;
+        }}
+        .detail-value {{
+            color: #666;
+        }}
+    </style>
+</head>
+<body>
+    <div class="order-card">
+        <div class="order-header">
+            <h1 class="order-id">Order #{order_id}</h1>
+            <p class="customer-id">Customer ID: {customer_id}</p>
+        </div>
+        
+        <div class="status {status_class}">{status}</div>
+        
+        <div class="order-details">
+            <div class="detail-row">
+                <span class="detail-label">Order Date:</span>
+                <span class="detail-value">{order_date}</span>
+            </div>
+            <div class="detail-row">
+                <span class="detail-label">Estimated Delivery:</span>
+                <span class="detail-value">{estimated_delivery}</span>
+            </div>
+            <div class="detail-row">
+                <span class="detail-label">Status:</span>
+                <span class="detail-value">{status}</span>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
