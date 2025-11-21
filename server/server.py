@@ -5,7 +5,7 @@ import os
 
 from app.handler.acs_media_handler import ACSMediaHandler
 from dotenv import load_dotenv
-from quart import Quart, websocket
+from quart import Quart, websocket, request, jsonify
 
 load_dotenv()
 
@@ -68,6 +68,48 @@ async def web_ws():
 async def index():
     """Serves the static index page."""
     return await app.send_static_file("index.html")
+
+
+@app.post("/api/tools/run")
+async def api_run_tool():
+    """Trigger a Voice Live tool/function for an active session."""
+    payload = await request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"error": "JSON body required"}), 400
+
+    session_id = payload.get("session_id")
+    function_name = payload.get("function_name")
+    arguments = payload.get("arguments") or {}
+    output = payload.get("output")
+    silent = bool(payload.get("silent", True))
+    response_modalities = payload.get("response_modalities")
+
+    if not session_id or not function_name:
+        return jsonify({"error": "session_id and function_name are required"}), 400
+
+    handler = ACSMediaHandler.get_active_handler(session_id)
+    if not handler:
+        return jsonify({"error": f"Session {session_id} is not active"}), 404
+
+    if response_modalities is not None and not isinstance(response_modalities, list):
+        return jsonify({"error": "response_modalities must be a list when provided"}), 400
+
+    if not isinstance(arguments, dict):
+        return jsonify({"error": "arguments must be an object"}), 400
+
+    try:
+        call_id = await handler.inject_tool_result(
+            function_name,
+            arguments=arguments,
+            output=output,
+            silent=silent,
+            response_modalities=response_modalities,
+        )
+    except Exception as exc:
+        logging.getLogger("api.tools").exception("Failed to trigger tool")
+        return jsonify({"error": str(exc)}), 500
+
+    return jsonify({"call_id": call_id})
 
 
 if __name__ == "__main__":

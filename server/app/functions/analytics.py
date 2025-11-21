@@ -61,20 +61,28 @@ def set_analytics_client(cosmos_client):
     analytics.cosmos_client = cosmos_client
 
 
-async def enhanced_check_order_status_handler(customer_id: str, order_id: str, session_id: str = None) -> str:
-    """Enhanced order status handler with analytics logging."""
+async def enhanced_schedule_appointment_handler(
+    patient_id: str,
+    appointment_type: str,
+    preferred_date: str,
+    session_id: str | None = None,
+) -> str:
+    """Enhanced tele-health appointment handler with analytics logging."""
+
     # Import here to avoid circular imports
-    from .order_functions import check_order_status_handler
-    
-    # Call the original handler
-    result = await check_order_status_handler(customer_id, order_id)
-    
-    # Log the function call for analytics
+    from .telehealth_functions import schedule_appointment_handler
+
+    result = await schedule_appointment_handler(patient_id, appointment_type, preferred_date)
+
     await analytics.log_function_call(
-        function_name="check_order_status",
-        arguments={"customer_id": customer_id, "order_id": order_id},
+        function_name="schedule_appointment",
+        arguments={
+            "patient_id": patient_id,
+            "appointment_type": appointment_type,
+            "preferred_date": preferred_date,
+        },
         result=result,
-        session_id=session_id
+        session_id=session_id,
     )
-    
+
     return result
