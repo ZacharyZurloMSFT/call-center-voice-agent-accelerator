@@ -6,12 +6,16 @@ import json
 import logging
 import uuid
 import os
+import re
 from datetime import datetime
 from urllib.parse import quote
 from typing import Any, Dict, Optional
+from xml.sax.saxutils import escape as xml_escape
 
 from websockets.asyncio.client import connect as ws_connect
 from websockets.typing import Data
+from azure.identity import DefaultAzureCredential
+from azure.core.exceptions import ClientAuthenticationError
 from ..functions import (
     build_patient_context,
     get_function_definitions,
@@ -21,6 +25,141 @@ from ..functions import (
 from ..cosmos_client import ConversationCosmosClient
 
 logger = logging.getLogger(__name__)
+
+
+_VOICE_LIVE_AAD_SCOPES = (
+    "https://ai.azure.com/.default",
+    "https://cognitiveservices.azure.com/.default",
+)
+
+
+_EMAIL_REGEX = re.compile(
+    r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
+    re.IGNORECASE,
+)
+
+_EMAIL_PUNCT_ALIAS: Dict[str, str] = {
+    "_": "underscore",
+    ".": "dot",
+    "-": "hyphen",
+    "@": "at",
+}
+
+
+# Explicit letter-name aliases to avoid voices expanding letters into
+# "A as in apple" style disambiguation.
+# Note: These are short, commonly understood pronunciations for US English.
+_LETTER_NAME_ALIAS: Dict[str, str] = {
+    "A": "ay",
+    "B": "bee",
+    "C": "see",
+    "D": "dee",
+    "E": "ee",
+    "F": "eff",
+    "G": "gee",
+    "H": "aitch",
+    "I": "eye",
+    "J": "jay",
+    "K": "kay",
+    "L": "el",
+    "M": "em",
+    "N": "en",
+    "O": "oh",
+    "P": "pee",
+    "Q": "cue",
+    "R": "ar",
+    "S": "ess",
+    "T": "tee",
+    "U": "you",
+    "V": "vee",
+    "W": "double u",
+    "X": "ex",
+    "Y": "why",
+    "Z": "zee",
+}
+
+
+def _email_to_spoken_tokens(email: str) -> str:
+    """Return a safe, punctuation-spoken, character-spaced fallback string."""
+
+    tokens: list[str] = []
+    for ch in email:
+        if ch.isalnum():
+            tokens.append(ch)
+            continue
+
+        alias = _EMAIL_PUNCT_ALIAS.get(ch)
+        if alias:
+            tokens.append(alias)
+        else:
+            tokens.append(ch)
+
+    # Use commas to force clearer separation of adjacent letter names.
+    # Example: "ACE" -> "A, C, E" (more reliable than "A C E" for some voices).
+    return ", ".join(tokens)
+
+
+def _email_to_ssml(email: str, *, break_ms: int = 200) -> str:
+    """Convert an email to SSML that spells characters and speaks punctuation.
+
+    Uses only tags commonly supported by OpenAI voices in Azure Speech:
+    speak, say-as, sub, break.
+    """
+
+    normalized = (email or "").strip()
+    if not normalized:
+        return "<speak></speak>"
+
+    # Use a slightly shorter break between letters than between punctuation tokens.
+    # This prevents coarticulation where adjacent letter names can merge
+    # (e.g., "C" ("see") followed by "E" ("ee") sounding like only "C").
+    token_break_ms = int(break_ms)
+    letter_break_ms = max(120, min(200, token_break_ms - 40))
+    token_break_tag = f'<break time="{token_break_ms}ms"/>'
+    letter_break_tag = f'<break time="{letter_break_ms}ms"/>'
+
+    parts: list[str] = ["<speak>"]
+
+    for ch in normalized:
+        # Letters: force the spoken form explicitly via <sub alias="..."> to avoid
+        # voices choosing expanded disambiguations like "A as in apple".
+        if ch.isalpha():
+            alias = _LETTER_NAME_ALIAS.get(ch.upper())
+            if alias:
+                parts.append(
+                    f'<sub alias="{xml_escape(alias)}">{xml_escape(ch)}</sub>'
+                )
+            else:
+                parts.append(
+                    f'<say-as interpret-as="characters">{xml_escape(ch)}</say-as>'
+                )
+            parts.append(letter_break_tag)
+            continue
+
+        # Digits: characters mode is typically read as digit names without the
+        # "as in" expansion.
+        if ch.isdigit():
+            parts.append(
+                f'<say-as interpret-as="characters">{xml_escape(ch)}</say-as>'
+            )
+            parts.append(letter_break_tag)
+            continue
+
+        alias = _EMAIL_PUNCT_ALIAS.get(ch)
+        if alias:
+            # Keep the original character as the visible form, speak the alias.
+            parts.append(f'<sub alias="{xml_escape(alias)}">{xml_escape(ch)}</sub>')
+        else:
+            # For unexpected characters, still force character spelling.
+            parts.append(f'<say-as interpret-as="characters">{xml_escape(ch)}</say-as>')
+        parts.append(token_break_tag)
+
+    # Trim trailing break for cleaner speech.
+    if parts and parts[-1] in {token_break_tag, letter_break_tag}:
+        parts.pop()
+
+    parts.append("</speak>")
+    return "".join(parts)
 
 # Track active ACS media handlers by Voice Live session id so background services
 # can direct tool invocations to the correct conversation.
@@ -100,6 +239,7 @@ class ACSMediaHandler:
         self.endpoint = config["AZURE_VOICE_LIVE_ENDPOINT"]
         self.model = config["VOICE_LIVE_MODEL"]
         self.api_key = config["AZURE_VOICE_LIVE_API_KEY"]
+        self._credential = DefaultAzureCredential()
         self.primary_voice = config.get(
             "AZURE_VOICE_PRIMARY_NAME",
             "en-US-Ava:DragonHDLatestNeural",
@@ -130,6 +270,67 @@ class ACSMediaHandler:
         self._context_task: Optional[asyncio.Task] = None
         self._sent_auto_greeting: bool = False
         self._pending_background_payload: Optional[Dict[str, Any]] = None
+        # Email readback support
+        self._last_email_readback: Optional[str] = None
+        self._pending_email_readback: Optional[Dict[str, str]] = None
+
+    async def _request_email_readback(self, email: str) -> None:
+        """Ask Voice Live to restate an email address using SSML.
+
+        The Realtime/Voice Live API doesn't explicitly document an SSML content part.
+        This implementation asks the model to output SSML-only, which some Voice Live
+        voice pipelines can interpret as SSML. If the service reports an error event,
+        we fall back to a plain spelled-out string.
+        """
+
+        if not self._is_ws_connected():
+            logger.debug(
+                "[VoiceLiveACSHandler] Email readback skipped; websocket not connected"
+            )
+            return
+
+        normalized = (email or "").strip()
+        if not normalized:
+            logger.debug("[VoiceLiveACSHandler] Email readback skipped; empty email")
+            return
+
+        email_for_log = normalized
+
+        ssml = _email_to_ssml(normalized, break_ms=200)
+        fallback = _email_to_spoken_tokens(normalized)
+
+        logger.info(
+            "[VoiceLiveACSHandler] Email readback requested for %s (ssml_chars=%d)",
+            email_for_log,
+            len(ssml),
+        )
+
+        # Keep a pending fallback in case the service rejects the SSML.
+        self._pending_email_readback = {"email": normalized, "fallback": fallback}
+
+        instructions = (
+            "The user just provided an email address. Repeat the email address back exactly. "
+            "Do not use phonetic alphabet and do not say 'as in' phrases. "
+            "Return ONLY SSML. Use only these tags: speak, say-as, sub, break. "
+            "Do not add any other text before or after the SSML. Output exactly this SSML:\n"
+            f"{ssml}"
+        )
+
+        await self._send_json(
+            {
+                "type": "response.create",
+                "response": {
+                    "modalities": ["audio"],
+                    "instructions": instructions,
+                    "cancel_previous": True,
+                },
+            }
+        )
+        self._response_in_progress = True
+        logger.debug(
+            "[VoiceLiveACSHandler] response.create sent for email readback (%s)",
+            email_for_log,
+        )
 
     def _generate_guid(self):
         return str(uuid.uuid4())
@@ -147,9 +348,6 @@ class ACSMediaHandler:
         if not self.endpoint:
             raise ValueError("AZURE_VOICE_LIVE_ENDPOINT is required")
 
-        if not self.api_key:
-            raise ValueError("AZURE_VOICE_LIVE_API_KEY is required for API key authentication")
-
         # Build WebSocket URL for realtime endpoint and specify model via query parameter
         base_ws = self.endpoint.rstrip("/").replace("https://", "wss://")
         url = (
@@ -157,15 +355,27 @@ class ACSMediaHandler:
             f"&model={quote(self.model)}"
         )
 
-        # Use API key header (voice_live_test_client.py uses 'api-key')
-        headers = {
-            "x-ms-client-request-id": self._generate_guid(),
-            "api-key": self.api_key,
-        }
+        # Auth strategy:
+        # - Default: Microsoft Entra ID via DefaultAzureCredential (Bearer token)
+        # - Optional: API key (if explicitly enabled)
+        use_api_key = (
+            bool(self.api_key)
+            and os.getenv("AZURE_VOICE_LIVE_USE_API_KEY", "").strip().lower() in {"1", "true", "yes"}
+        )
+
+        headers = {"x-ms-client-request-id": self._generate_guid()}
+
+        if use_api_key:
+            headers["api-key"] = self.api_key
+            logger.info("[VoiceLiveACSHandler] Connecting to Voice Live using API key auth")
+        else:
+            token = await self._get_voicelive_access_token()
+            headers["Authorization"] = f"Bearer {token}"
+            logger.info("[VoiceLiveACSHandler] Connecting to Voice Live using DefaultAzureCredential")
 
         # Establish websocket connection
         self.ws = await ws_connect(url, additional_headers=headers)
-        logger.info("[VoiceLiveACSHandler] Connected to Voice Live API using API key auth")
+        logger.info("[VoiceLiveACSHandler] Connected to Voice Live API")
 
         await self._initialize_patient_context()
 
@@ -180,6 +390,28 @@ class ACSMediaHandler:
 
         asyncio.create_task(self._receiver_loop())
         self.send_task = asyncio.create_task(self._sender_loop())
+
+    async def _get_voicelive_access_token(self) -> str:
+        """Acquire an access token for Voice Live.
+
+        Voice Live supports Entra tokens minted for the `https://ai.azure.com/.default`
+        scope (and legacy `https://cognitiveservices.azure.com/.default`).
+        """
+
+        loop = asyncio.get_running_loop()
+
+        def _get_token_sync() -> str:
+            last_error: Optional[Exception] = None
+            for scope in _VOICE_LIVE_AAD_SCOPES:
+                try:
+                    return self._credential.get_token(scope).token
+                except Exception as exc:  # keep trying scopes
+                    last_error = exc
+            if isinstance(last_error, ClientAuthenticationError):
+                raise last_error
+            raise ClientAuthenticationError(message=str(last_error) if last_error else "auth failed")
+
+        return await loop.run_in_executor(None, _get_token_sync)
 
     async def init_incoming_websocket(self, socket, is_raw_audio=True):
         """Sets up incoming ACS WebSocket."""
@@ -543,6 +775,30 @@ class ACSMediaHandler:
                             except Exception:
                                 logger.exception("Failed to buffer user transcript")
 
+                            # If the user provided an email address, trigger a dedicated readback.
+                            if isinstance(transcript, str):
+                                match = _EMAIL_REGEX.search(transcript)
+                                if match:
+                                    email = match.group(0)
+                                    email_for_log = email
+                                    logger.info(
+                                        "[VoiceLiveACSHandler] Detected email in transcript: %s",
+                                        email_for_log,
+                                    )
+                                    if email != self._last_email_readback:
+                                        self._last_email_readback = email
+                                        try:
+                                            await self._request_email_readback(email)
+                                        except Exception:
+                                            logger.exception(
+                                                "[VoiceLiveACSHandler] Failed to request email readback"
+                                            )
+                                    else:
+                                        logger.debug(
+                                            "[VoiceLiveACSHandler] Skipping email readback (duplicate): %s",
+                                            email_for_log,
+                                        )
+
                         case "conversation.item.input_audio_transcription.failed":
                             error_msg = event.get("error")
                             logger.warning("Transcription Error: %s", error_msg)
@@ -556,6 +812,14 @@ class ACSMediaHandler:
                             response = event.get("response", {})
                             logger.debug("Response done: Id=%s", response.get("id"))
                             self._response_in_progress = False
+                            if self._pending_email_readback:
+                                pending_email = self._pending_email_readback.get("email")
+                                email_for_log = pending_email
+                                logger.debug(
+                                    "[VoiceLiveACSHandler] Clearing pending email readback after response.done (%s)",
+                                    email_for_log,
+                                )
+                                self._pending_email_readback = None
                             status_details = response.get("status_details")
                             if status_details:
                                 logger.info(
@@ -575,16 +839,63 @@ class ACSMediaHandler:
                             logger.warning("Response failed: %s", response)
                             self._response_in_progress = False
                             error_code = response.get("error", {}).get("code") if isinstance(response, dict) else None
+                            if self._pending_email_readback:
+                                pending = self._pending_email_readback
+                                self._pending_email_readback = None
+                                fallback = pending.get("fallback")
+                                pending_email = pending.get("email")
+                                email_for_log = pending_email
+                                logger.warning(
+                                    "[VoiceLiveACSHandler] Email readback response.failed; falling back (%s)",
+                                    email_for_log,
+                                )
+                                if fallback:
+                                    try:
+                                        await self._send_json(
+                                            {
+                                                "type": "response.create",
+                                                "response": {
+                                                    "modalities": ["audio"],
+                                                    "instructions": (
+                                                        "Repeat the user's email address back, spelling it out character by character. "
+                                                        "Say 'at' for @, 'dot' for ., 'underscore' for _, and 'hyphen' for -. "
+                                                        f"Say exactly: {fallback}"
+                                                    ),
+                                                    "cancel_previous": True,
+                                                },
+                                            }
+                                        )
+                                        self._response_in_progress = True
+                                    except Exception:
+                                        logger.exception(
+                                            "[VoiceLiveACSHandler] Failed to send fallback email readback"
+                                        )
                             if error_code == "speech_synthesis_error":
                                 await self._handle_synthesis_failure("response_failed_event")
 
                         case "response.interrupted":
                             logger.info("Response interrupted by service")
                             self._response_in_progress = False
+                            if self._pending_email_readback:
+                                pending_email = self._pending_email_readback.get("email")
+                                email_for_log = pending_email
+                                logger.debug(
+                                    "[VoiceLiveACSHandler] Clearing pending email readback after response.interrupted (%s)",
+                                    email_for_log,
+                                )
+                                self._pending_email_readback = None
 
                         case "response.canceled" | "response.cancelled":
                             logger.warning("Response canceled: %s", event.get("response"))
                             self._response_in_progress = False
+                            if self._pending_email_readback:
+                                pending_email = self._pending_email_readback.get("email")
+                                email_for_log = pending_email
+                                logger.debug(
+                                    "[VoiceLiveACSHandler] Clearing pending email readback after response.canceled (%s)",
+                                    email_for_log,
+                                )
+                                self._pending_email_readback = None
 
                         case "response.text.delta":
                             text = event.get("text", "")
@@ -684,6 +995,44 @@ class ACSMediaHandler:
                             else:
                                 logger.error("Voice Live Error: %s", error_info)
                                 self._response_in_progress = False
+
+                                # If we were trying to read back an email using SSML, fall back to a
+                                # plain spelled-out string.
+                                if self._pending_email_readback:
+                                    pending = self._pending_email_readback
+                                    fallback = pending.get("fallback")
+                                    pending_email = pending.get("email")
+                                    email_for_log = pending_email
+                                    logger.warning(
+                                        "[VoiceLiveACSHandler] Email readback failed; using fallback (%s)",
+                                        email_for_log,
+                                    )
+                                    self._pending_email_readback = None
+                                    if fallback:
+                                        try:
+                                            await self._send_json(
+                                                {
+                                                    "type": "response.create",
+                                                    "response": {
+                                                        "modalities": ["audio"],
+                                                        "instructions": (
+                                                            "Repeat the user's email address back, spelling it out character by character. "
+                                                            "Say 'at' for @, 'dot' for ., 'underscore' for _, and 'hyphen' for -. "
+                                                            f"Say exactly: {fallback}"
+                                                        ),
+                                                        "cancel_previous": True,
+                                                    },
+                                                }
+                                            )
+                                            self._response_in_progress = True
+                                            logger.debug(
+                                                "[VoiceLiveACSHandler] Fallback email readback response.create sent (%s)",
+                                                email_for_log,
+                                            )
+                                        except Exception:
+                                            logger.exception(
+                                                "[VoiceLiveACSHandler] Failed to send fallback email readback"
+                                            )
                                 if code == "speech_synthesis_error":
                                     await self._handle_synthesis_failure("error_event")
 
