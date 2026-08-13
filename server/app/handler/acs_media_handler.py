@@ -17,9 +17,7 @@ from websockets.typing import Data
 from azure.identity import DefaultAzureCredential
 from azure.core.exceptions import ClientAuthenticationError
 from ..functions import (
-    build_patient_context,
     get_function_definitions,
-    get_patient_profile,
     handle_function_call,
 )
 from ..cosmos_client import ConversationCosmosClient
@@ -175,19 +173,30 @@ def _unregister_handler(session_id: Optional[str]) -> None:
         _ACTIVE_HANDLERS.pop(session_id, None)
 
 
-TELEHEALTH_BASE_PROMPT = (
-    "You are a compassionate virtual care coordinator supporting tele-health visits. "
-    "Confirm patient identity before sharing private details, keep explanations clear, and "
-    "offer to connect the patient with clinical staff when questions fall outside your scope. "
-    "You can schedule tele-health or in-clinic appointments, summarize recent care activity, "
-    "and submit prescription refill requests using the available tools."
+IDENTITY_VERIFICATION_PROMPT = (
+    "You are a friendly patient identity verification assistant. Your only job is to "
+    "collect three pieces of information from the caller and then verify them: "
+    "(1) full name, (2) date of birth, and (3) phone number.\n"
+    "\n"
+    "Conversation rules:\n"
+    "- Greet the caller briefly and ask for the three pieces of information. "
+    "Let the caller know they can give all three at once or one at a time.\n"
+    "- If the caller gives you only some of the values, thank them for what they gave "
+    "and ask for the missing ones. Never re-ask for information you already have.\n"
+    "- Never guess or invent values. If something was unclear, ask the caller to repeat it.\n"
+    "- Once and only once you have all three values, call the tool "
+    "`verify_patient_identity` with the exact values the caller provided.\n"
+    "- After the tool returns, tell the caller clearly whether their identity was "
+    "confirmed or declined. If declined, offer to try again from the beginning.\n"
+    "- Do not answer questions unrelated to identity verification. Politely steer the "
+    "conversation back to collecting the three values."
 )
 
 
-def compose_instructions(patient_context: Optional[str] = None) -> str:
-    """Return the base tele-health instructions (patient data is injected separately)."""
+def compose_instructions() -> str:
+    """Return the identity-verification system instructions."""
 
-    return TELEHEALTH_BASE_PROMPT
+    return IDENTITY_VERIFICATION_PROMPT
 
 
 def session_config(voice_name: str | None = None):
@@ -262,14 +271,7 @@ class ACSMediaHandler:
         self.cosmos_client = ConversationCosmosClient(config)
         # Track if a response.create request is already in flight
         self._response_in_progress = False
-        # Track tele-health specific conversation context
-        self.patient_context: Optional[str] = None
-        self.patient_id: Optional[str] = None
-        self.patient_profile: Optional[Dict[str, Any]] = None
-        self.default_patient_id: str = config.get("DEFAULT_PATIENT_ID", "PATIENT001")
-        self._context_task: Optional[asyncio.Task] = None
         self._sent_auto_greeting: bool = False
-        self._pending_background_payload: Optional[Dict[str, Any]] = None
         # Email readback support
         self._last_email_readback: Optional[str] = None
         self._pending_email_readback: Optional[Dict[str, str]] = None
@@ -376,8 +378,6 @@ class ACSMediaHandler:
         # Establish websocket connection
         self.ws = await ws_connect(url, additional_headers=headers)
         logger.info("[VoiceLiveACSHandler] Connected to Voice Live API")
-
-        await self._initialize_patient_context()
 
         instructions = self._compose_instructions()
         logger.info(
@@ -494,13 +494,6 @@ class ACSMediaHandler:
         call_id = self._generate_call_id()
         args = arguments or {}
 
-        patient_id = args.get("patient_id")
-        if isinstance(patient_id, str):
-            normalized_patient_id = patient_id.strip()
-            if normalized_patient_id:
-                args["patient_id"] = normalized_patient_id
-                self._schedule_patient_context_refresh(normalized_patient_id)
-
         logger.info(
             "[VoiceLiveACSHandler] Injecting tool result: name=%s call_id=%s silent=%s",
             function_name,
@@ -572,109 +565,6 @@ class ACSMediaHandler:
             }
         )
 
-    async def _initialize_patient_context(self) -> None:
-        """Bootstrap patient context before the first session update."""
-
-        default_patient_id = (self.default_patient_id or "PATIENT001").strip()
-        if not default_patient_id:
-            return
-
-        self.patient_id = default_patient_id
-        await self._apply_patient_context(default_patient_id)
-
-    def _schedule_patient_context_refresh(self, patient_id: str) -> None:
-        if patient_id == self.patient_id and self.patient_profile:
-            return
-
-        self.patient_id = patient_id
-
-        if self._context_task and not self._context_task.done():
-            self._context_task.cancel()
-
-        self._context_task = asyncio.create_task(self._refresh_patient_context(patient_id))
-        self._context_task.add_done_callback(self._on_context_task_done)
-
-    async def _refresh_patient_context(self, patient_id: str) -> None:
-        try:
-            await self._apply_patient_context(patient_id)
-        except asyncio.CancelledError:  # pragma: no cover - cooperative cancellation
-            raise
-        except Exception:  # pragma: no cover - defensive logging
-            logger.exception(
-                "[VoiceLiveACSHandler] Failed to refresh patient context for %s",
-                patient_id,
-            )
-        finally:
-            self._context_task = None
-
-    async def _apply_patient_context(self, patient_id: str) -> None:
-        loop = asyncio.get_running_loop()
-
-        context_text: Optional[str] = None
-        try:
-            context_text = await loop.run_in_executor(
-                None, build_patient_context, patient_id
-            )
-        except Exception:
-            logger.exception(
-                "[VoiceLiveACSHandler] Failed to build patient overview for %s",
-                patient_id,
-            )
-            context_text = None
-
-        profile = get_patient_profile(patient_id)
-
-        self.patient_context = context_text
-        self.patient_profile = profile
-
-        if not self.ws or not self._is_ws_connected():
-            return
-
-        background_payload: Dict[str, Any] = {"patientId": patient_id}
-        if profile:
-            background_payload["profile"] = profile
-        if context_text:
-            background_payload["overview"] = context_text
-
-        if len(background_payload) > 1:
-            self._pending_background_payload = background_payload
-            if self.session_id and self._is_ws_connected():
-                await self._inject_background_context(background_payload)
-        else:
-            self._pending_background_payload = None
-
-    async def _inject_background_context(self, payload: Dict[str, Any]) -> None:
-        message = {
-            "type": "conversation.item.create",
-            "item": {
-                "type": "message",
-                "role": "system",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": f"BACKGROUND_PATIENT {json.dumps(payload, ensure_ascii=False)}",
-                    }
-                ],
-            },
-        }
-
-        await self._send_json(message)
-        logger.info(
-            "[VoiceLiveACSHandler] Injected patient background context:\n%s",
-            json.dumps(payload, indent=2, ensure_ascii=False),
-        )
-        self._pending_background_payload = None
-
-    def _on_context_task_done(self, task: asyncio.Task) -> None:
-        try:
-            task.result()
-        except asyncio.CancelledError:
-            pass
-        except Exception:  # pragma: no cover - defensive logging
-            logger.exception(
-                "[VoiceLiveACSHandler] Patient context update task raised an error"
-            )
-
     def _is_ws_connected(self) -> bool:
         """Best-effort check for an open Voice Live websocket across library versions."""
         if not self.ws:
@@ -742,8 +632,6 @@ class ACSMediaHandler:
                             if not self._sent_auto_greeting:
                                 await self._maybe_request_response("session_created_greeting")
                                 self._sent_auto_greeting = True
-                            if self._pending_background_payload and self._is_ws_connected():
-                                await self._inject_background_context(self._pending_background_payload)
 
                         case "input_audio_buffer.cleared":
                             logger.debug("Input audio buffer cleared")

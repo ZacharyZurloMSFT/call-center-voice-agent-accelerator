@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Voice Live Agent Demo</title>
+  <title>Patient Identity Verification</title>
   <style>
     body {
       margin: 0;
@@ -79,8 +79,8 @@
   </style>
 </head>
 <body>
-  <h1>🎙️ Tele-Health Voice Assistant</h1>
-  <div class="subtitle">Chat with a virtual care coordinator in real time. Ask about upcoming appointments, prescription refills, and medical history using a patient ID.</div>
+  <h1>🪪 Patient Identity Verification</h1>
+  <div class="subtitle">Speak with a voice agent to verify your identity. Share your full name, date of birth, and phone number — all at once, or one at a time — and the agent will confirm whether they match our records.</div>
 
   <div class="controls">
     <button id="startBtn" onclick="startStreaming()" title="Start talking to the voice agent">
@@ -92,14 +92,14 @@
   </div>
 
   <div style="margin-top: 2rem; padding: 1rem; background: #e8f4fd; border-radius: 0.5rem; max-width: 600px; text-align: left;">
-    <h3 style="margin-top: 0; color: #0078d4;">🩺 Try These Sample Prompts:</h3>
+    <h3 style="margin-top: 0; color: #0078d4;">🧪 Try These Sample Callers:</h3>
     <ul style="margin: 0.5rem 0;">
-      <li><strong>Patient PATIENT001</strong> - "Summarize my recent health history."</li>
-      <li><strong>Patient PATIENT002</strong> - "Schedule a follow-up endocrinology appointment for next Tuesday."</li>
-      <li><strong>Any patient</strong> - "Submit a refill request for my Albuterol inhaler."</li>
+      <li><strong>All at once</strong> — "My name is Avery Johnson, date of birth March 12, 1985, phone 123-123-1234."</li>
+      <li><strong>One at a time</strong> — Start with just "Jordan Lee", then give "November 4, 1992", then "555-987-6543".</li>
+      <li><strong>Mismatch</strong> — Give a real name and DOB but a wrong phone number to see a decline.</li>
     </ul>
     <p style="margin-bottom: 0; font-size: 0.9rem; color: #666;">
-      Example: "Please review PATIENT001's latest visit notes and schedule a virtual check-in." Use the patient ID when prompted.
+      The agent only verifies identity — it will politely redirect any other requests.
     </p>
   </div>
 
