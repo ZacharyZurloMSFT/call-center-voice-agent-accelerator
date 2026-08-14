@@ -186,8 +186,12 @@ IDENTITY_VERIFICATION_PROMPT = (
     "- Never guess or invent values. If something was unclear, ask the caller to repeat it.\n"
     "- Once and only once you have all three values, call the tool "
     "`verify_patient_identity` with the exact values the caller provided.\n"
-    "- After the tool returns, tell the caller clearly whether their identity was "
-    "confirmed or declined. If declined, offer to try again from the beginning.\n"
+    "- After the tool returns, immediately speak the result out loud in one short "
+    "sentence, and then continue as follows:\n"
+    "    * If the tool result starts with CONFIRMED: say something like \"Great, I've "
+    "verified your identity.\" and then ask \"What can I help you with today?\"\n"
+    "    * If the tool result starts with DECLINED: briefly apologize (for example, "
+    "\"I wasn't able to verify that\") and offer to start over from the beginning.\n"
     "- Do not answer questions unrelated to identity verification. Politely steer the "
     "conversation back to collecting the three values."
 )
@@ -271,6 +275,10 @@ class ACSMediaHandler:
         self.cosmos_client = ConversationCosmosClient(config)
         # Track if a response.create request is already in flight
         self._response_in_progress = False
+        # Set when we send a function_call_output back and need Voice Live to speak
+        # a follow-up response. Consumed in response.done to avoid a race where the
+        # outer response containing the function_call hasn't ended yet.
+        self._pending_response_after_function_call: bool = False
         self._sent_auto_greeting: bool = False
         # Email readback support
         self._last_email_readback: Optional[str] = None
@@ -700,6 +708,12 @@ class ACSMediaHandler:
                             response = event.get("response", {})
                             logger.debug("Response done: Id=%s", response.get("id"))
                             self._response_in_progress = False
+                            if self._pending_response_after_function_call:
+                                self._pending_response_after_function_call = False
+                                logger.info(
+                                    "[VoiceLiveACSHandler] Requesting follow-up response after function call"
+                                )
+                                await self._maybe_request_response("post_function_call_followup")
                             if self._pending_email_readback:
                                 pending_email = self._pending_email_readback.get("email")
                                 email_for_log = pending_email
@@ -726,6 +740,7 @@ class ACSMediaHandler:
                             response = event.get("response", {})
                             logger.warning("Response failed: %s", response)
                             self._response_in_progress = False
+                            self._pending_response_after_function_call = False
                             error_code = response.get("error", {}).get("code") if isinstance(response, dict) else None
                             if self._pending_email_readback:
                                 pending = self._pending_email_readback
@@ -827,7 +842,10 @@ class ACSMediaHandler:
                                     result = await handle_function_call(function_name, args_dict)
                                     await self._send_function_call_output_item(call_id, result)
 
-                                    # Trigger response generation (speech comes from response.create, not the item itself)
+                                    # Mark that we need Voice Live to speak a follow-up. If the outer
+                                    # response has already ended, _maybe_request_response will send
+                                    # it now; otherwise response.done will consume the flag.
+                                    self._pending_response_after_function_call = True
                                     await self._maybe_request_response("function_call_complete")
                                     
                                 except Exception as e:
@@ -836,6 +854,7 @@ class ACSMediaHandler:
                                         call_id,
                                         f"Error processing request: {str(e)}",
                                     )
+                                    self._pending_response_after_function_call = True
                                     await self._maybe_request_response("function_call_error")
 
                         case "response.function_call_arguments.delta":
